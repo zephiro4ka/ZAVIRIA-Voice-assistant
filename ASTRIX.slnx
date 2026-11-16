@@ -1,7 +1,0 @@
-<Solution>
-  <Configurations>
-    <Platform Name="x64" />
-    <Platform Name="x86" />
-  </Configurations>
-  <Project Path="ASTRIX/ASTRIX.vcxproj" Id="c5d588fa-d46c-4b3a-a934-352c8a0cf2de" />
-</Solution>

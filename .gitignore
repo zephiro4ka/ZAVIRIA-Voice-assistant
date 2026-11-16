@@ -30,3 +30,24 @@ ASTRIX/third_party/llama.cpp/*.dll
 ASTRIX/third_party/onnxruntime/lib/
 dist/
 .claude/
+
+# ZAVIRIA (после переименования из ASTRIX)
+ZAVIRIA/imgui.ini
+ZAVIRIA/third_party/silero/venv/
+ZAVIRIA/third_party/llama.cpp/*.exe
+ZAVIRIA/third_party/llama.cpp/*.dll
+ZAVIRIA/third_party/onnxruntime/lib/
+pie.json
+notes.txt
+*.bmp.tmp
+
+# заметки для Claude — личное, не выкладывать
+CLAUDE.md
+
+# Android: сборка и локальные пути
+android/.gradle/
+android/**/build/
+android/local.properties
+android/.idea/
+*.jks
+*.keystore

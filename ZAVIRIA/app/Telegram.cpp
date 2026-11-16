@@ -1,0 +1,675 @@
+#include "Telegram.h"
+
+#include "EcoMode.h"
+#include "Lang.h"
+#include "Security.h"
+#include "Http.h"
+#include "Input.h"
+#include "LocalAi.h"
+#include "Log.h"
+#include "MediaNow.h"
+#include "Pc.h"
+#include "PowerMode.h"
+#include "RemoteDesktop.h"
+#include "Screen.h"
+#include "Settings.h"
+#include "Skills.h"
+#include "State.h"
+#include "SystemMonitor.h"
+#include "TextUtils.h"
+#include "Voice.h"
+
+#include "../third_party/nlohmann/json.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <chrono>
+#include <ctime>
+#include <mutex>
+#include <optional>
+#include <thread>
+
+using nlohmann::json;
+
+namespace {
+    constexpr const wchar_t* kHost = L"api.telegram.org";
+
+    std::mutex g_mutex;
+    std::string g_token;
+    long long g_owner = 0;
+    bool g_enabled = false;
+    std::string g_status = "выключен";
+    std::atomic<bool> g_ready{ false };
+    std::atomic<int> g_generation{ 0 }; // Reload — старый поток опроса сам завершится
+    std::atomic<bool> g_solving{ false };
+
+    // кнопки под полем ввода в телеграме
+    const char* kAskScreen = "📸 Ответ с экрана";
+    const char* kDesktop = "🖥 Рабочий стол";
+    const char* kLouder = "🔊 +";
+    const char* kQuieter = "🔉 −";
+    const char* kPowerOff = "⏻ Выключить";
+    constexpr const char* kKeyboardVersion = "3"; // поменялись кнопки — один раз убрать старые, даже без приветствия
+    std::string g_pultUrl; // адрес пульта; меняется при каждом запуске туннеля
+
+    // убранные с клавиатуры кнопки остаются командами и текстом
+    const char* kScreen = "📸 Экран";
+    const char* kSolve = "🧠 Реши с экрана";
+    const char* kStatus = "📊 Состояние";
+    const char* kLock = "🔒 Блокировка";
+    const char* kShowLock = "🔆 Показать экран блокировки"; // вместо «Блокировки», пока компьютер заблокирован
+    const char* kPause = "⏯ Пауза";
+    const char* kNext = "⏭ Дальше";
+    const char* kStandby = "🌙 Выключить (бот на связи)";
+    const char* kWake = "☀ Включить";
+
+    // снимок экрана ждёт, пока владелец напишет задачу
+    struct PendingShot { std::vector<uint8_t> image; ULONGLONG at = 0; };
+    constexpr ULONGLONG kPendingShotMs = 15 * 60 * 1000;
+    std::optional<PendingShot> g_pendingShot;
+
+    json Keyboard() {
+        return { { "remove_keyboard", true } }; // вместо кнопок — приложение в меню бота
+    }
+
+    struct Config_ { std::string token; long long owner; };
+    Config_ Current() {
+        std::lock_guard lock(g_mutex);
+        return { g_token, g_owner };
+    }
+
+    std::wstring Path(const std::string& token, const std::string& method) { return Text::ToWide("/bot" + token + "/" + method); }
+
+    json Call(const std::string& method, const json& body, int timeoutMs = 20000) {
+        const json translated = Lang::IsEnglish() ? json::parse(Lang::TranslateText(body.dump()), nullptr, false) : json(); // ответы бота на выбранном языке
+        const json& payload = translated.is_object() ? translated : body;
+        const auto c = Current();
+        if (c.token.empty()) return {};
+        const std::string response = Http::HttpsPost(kHost, Path(c.token, method), payload.dump(), "application/json", timeoutMs);
+        return json::parse(response, nullptr, false);
+    }
+
+    constexpr long long kPhoneChat = -7777; // ответы приложению на телефоне, а не в чат
+    std::mutex g_phoneMutex;
+    json g_phoneBox = json::array();
+
+    void PhonePush(const json& item) {
+        std::lock_guard lock(g_phoneMutex);
+        if (g_phoneBox.size() < 40) g_phoneBox.push_back(item);
+    }
+
+    std::string StripTags(const std::string& text) {
+        std::string out;
+        bool inside = false;
+        for (char c : text) {
+            if (c == '<') inside = true;
+            else if (c == '>') inside = false;
+            else if (!inside) out += c;
+        }
+        return out;
+    }
+
+    void Reply(long long chat, const std::string& text, const json& markup = json(), bool html = false) {
+        if (chat == kPhoneChat) { PhonePush({ { "text", html ? StripTags(text) : text } }); return; }
+        // у телеграма предел — 4096 символов в сообщении (HTML не режем — он всегда короткий)
+        const std::wstring wide = Text::ToWide(text.empty() ? "Готово ✅" : text);
+        const size_t piece = html ? wide.size() + 1 : 3800;
+        for (size_t at = 0; at < wide.size(); at += piece) {
+            json body = { { "chat_id", chat }, { "text", Text::ToUtf8(wide.substr(at, piece)) } };
+            if (html) body["parse_mode"] = "HTML";
+            if (!markup.is_null() && at + piece >= wide.size()) body["reply_markup"] = markup;
+            Call("sendMessage", body);
+        }
+    }
+
+    std::string Html(const std::string& text) { // экранирование для parse_mode=HTML
+        std::string out;
+        for (char c : text) out += c == '<' ? "&lt;" : c == '>' ? "&gt;" : c == '&' ? "&amp;" : std::string(1, c);
+        return out;
+    }
+
+    // ▰▰▰▱▱▱▱▱▱▱ — полоска из 10 делений
+    std::string Bar(float percent) {
+        const int filled = std::clamp(static_cast<int>(std::lround(percent / 10.0f)), 0, 10);
+        std::string bar;
+        for (int i = 0; i < 10; ++i) bar += i < filled ? "▰" : "▱";
+        return bar;
+    }
+
+    std::string Temp(float t) {
+        if (t <= 0) return "";
+        const char* mark = t < 60 ? "🟢" : t < 80 ? "🟡" : "🔴";
+        char text[32];
+        snprintf(text, sizeof(text), "  %s %d°C", mark, static_cast<int>(std::lround(t)));
+        return text;
+    }
+
+    std::string VolumeText() {
+        Sleep(120); // Windows применяет нажатия клавиш громкости не мгновенно
+        const int v = Pc::Volume().value_or(0);
+        return std::string(Pc::IsMuted() ? "🔇" : "🔊") + " <b>Громкость " + std::to_string(v) + "%</b>\n<code>" + Bar(static_cast<float>(v)) + "</code>";
+    }
+
+    bool Photo(long long chat, const std::vector<uint8_t>& jpeg, const std::string& caption) {
+        if (chat == kPhoneChat) { PhonePush({ { "photo", Security::Base64(jpeg.data(), jpeg.size()) }, { "text", caption } }); return !jpeg.empty(); }
+        const auto c = Current();
+        if (c.token.empty() || jpeg.empty()) return false;
+        const std::string boundary = "----AnyaBoundary" + std::to_string(GetTickCount64());
+        std::string body;
+        auto field = [&](const char* name, const std::string& value) {
+            body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + name + "\"\r\n\r\n" + value + "\r\n";
+        };
+        field("chat_id", std::to_string(chat));
+        if (!caption.empty()) field("caption", Text::ToUtf8(Text::ToWide(caption).substr(0, 1000)));
+        body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"screen.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+        body.append(reinterpret_cast<const char*>(jpeg.data()), jpeg.size());
+        body += "\r\n--" + boundary + "--\r\n";
+        const std::string response = Http::HttpsPost(kHost, Path(c.token, "sendPhoto"), body, "multipart/form-data; boundary=" + boundary, 60000);
+        return response.find("\"ok\":true") != std::string::npos;
+    }
+
+    // Файл в чат (приложение для телефона): нажал в Telegram — Android предложит установить, отладка по USB не нужна
+    bool Document(long long chat, const std::string& data, const std::string& name, const std::string& caption) {
+        const auto c = Current();
+        if (c.token.empty() || data.empty() || chat == kPhoneChat) return false;
+        const std::string boundary = "----ZavBoundary" + std::to_string(GetTickCount64());
+        std::string body;
+        body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n" + std::to_string(chat) + "\r\n";
+        if (!caption.empty()) body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n" + caption + "\r\n";
+        body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"document\"; filename=\"" + name + "\"\r\nContent-Type: application/vnd.android.package-archive\r\n\r\n";
+        body += data;
+        body += "\r\n--" + boundary + "--\r\n";
+        const std::string response = Http::HttpsPost(kHost, Path(c.token, "sendDocument"), body, "multipart/form-data; boundary=" + boundary, 120000);
+        return response.find("\"ok\":true") != std::string::npos;
+    }
+
+    void SendPhoneApp(long long chat) {
+        std::string apk;
+        if (FILE* f = _wfopen((Text::ExecutableDirectory() + L"\\phone\\zaviria.apk").c_str(), L"rb")) {
+            char buf[65536];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) apk.append(buf, n);
+            fclose(f);
+        }
+        if (apk.empty()) { Reply(chat, "Приложения для телефона рядом с программой нет — его кладёт установщик ZAVIRIA."); return; }
+        if (!Document(chat, apk, "ZAVIRIA.apk", "📱 ZAVIRIA для телефона. Нажми на файл — Android предложит установить (один раз разреши установку из Telegram). Потом приложение будет обновляться с ПК само."))
+            Reply(chat, "Не получилось отправить файл — попробуй ещё раз.");
+    }
+
+    // Фото с телефона: скачать самое большое
+    std::string DownloadPhoto(const json& photos) {
+        if (!photos.is_array() || photos.empty()) return {};
+        const std::string id = photos.back().value("file_id", "");
+        const json file = Call("getFile", { { "file_id", id } });
+        const std::string path = file.contains("result") ? file["result"].value("file_path", "") : "";
+        if (path.empty()) return {};
+        return Http::HttpsGet(kHost, Text::ToWide("/file/bot" + Current().token + "/" + path), 30000);
+    }
+
+    bool ScreenAllowed(long long chat) {
+        if (Config::Value("privacy", "screen", "1") == "1") return true;
+        Reply(chat, "Снимки экрана выключены в настройках ZAVIRIA, раздел «Приватность».");
+        return false;
+    }
+
+    // Снимок экрана → нейросеть → ответ (снимок отдельно, чтобы было видно, что она решала)
+    void SolveScreen(long long chat, const std::string& question) {
+        if (!ScreenAllowed(chat)) return;
+        if (g_solving.exchange(true)) { Reply(chat, "Я уже решаю — подожди немного"); return; }
+        Reply(chat, "Смотрю на экран и думаю над задачей… 🧠 Сложную решаю внимательно — это займёт 1–3 минуты.");
+        const auto shot = Screen::CaptureJpeg(0, 80);
+        const auto forAi = Screen::CaptureJpeg(1280, 85);
+        Photo(chat, shot, "Вот что на экране");
+        std::string answer;
+        if (!Ai::CanSee()) answer = "Нейросеть ещё не готова или у модели нет «глаз» (файла mmproj) — не могу прочитать экран.";
+        else answer = Ai::Quiet(question.empty() ? "Реши задачу на этом снимке экрана." : question, Screen::Base64(forAi), true);
+        Reply(chat, answer.empty() ? "Не получилось решить — нейросеть не ответила" : answer);
+        g_solving = false;
+    }
+
+    // Шаг 1: снимок приходит владельцу, бот ждёт текст задачи
+    void AskAboutScreen(long long chat) {
+        if (!ScreenAllowed(chat)) return;
+        if (!Ai::CanSee()) { Reply(chat, "Нейросеть ещё не готова или у модели нет «глаз» (файла mmproj) — не могу прочитать экран."); return; }
+        auto image = Screen::CaptureJpeg(1280, 85);
+        const auto shot = Screen::CaptureJpeg(0, 80);
+        if (image.empty() || shot.empty()) { Reply(chat, "Не получилось снять экран"); return; }
+        {
+            std::lock_guard lock(g_mutex);
+            g_pendingShot = PendingShot{ std::move(image), GetTickCount64() };
+        }
+        Photo(chat, shot, "Что сделать с этим снимком? Напиши задачу следующим сообщением.");
+    }
+
+    // Шаг 2: задача пришла — отвечаем по тому самому снимку
+    void SolveShot(long long chat, std::vector<uint8_t> image, std::string task) {
+        if (g_solving.exchange(true)) { Reply(chat, "Я уже решаю — подожди немного"); return; }
+        Reply(chat, "Думаю над задачей… 🧠 Сложную решаю внимательно — это займёт 1–3 минуты.");
+        const std::string answer = Ai::Quiet(task, Screen::Base64(image), true);
+        Reply(chat, answer.empty() ? "Не получилось решить — нейросеть не ответила" : answer);
+        g_solving = false;
+    }
+
+    std::string PultUrl() {
+        std::lock_guard lock(g_mutex);
+        return g_pultUrl;
+    }
+
+    json PultButton(const std::string& url) {
+        return { { "inline_keyboard", json::array({ json::array({ { { "text", "📱 Открыть пульт" }, { "web_app", { { "url", url } } } } }) }) } };
+    }
+
+    void OpenPult(long long chat) {
+        const std::string url = PultUrl();
+        if (url.empty()) { Reply(chat, "📱 Пульт ещё запускается или выключен в настройках программы. Попробуй через полминуты."); return; }
+        Reply(chat, "Твой пульт 👇", PultButton(url));
+    }
+
+    // Пульт работает, пока включён бот: туннель упал — поднимаем новый и обновляем кнопку меню
+    void KeepPult(int generation) {
+        std::string shown, lastError;
+        auto pause = [&](int seconds) { for (int i = 0; i < seconds * 4 && generation == g_generation.load(); ++i) Sleep(250); };
+        while (generation == g_generation.load()) {
+            const auto c = Current();
+            const auto result = RemoteDesktop::Start(c.token, c.owner, nullptr);
+            if (generation != g_generation.load()) return;
+            if (!result.error.empty()) {
+                if (result.error != lastError) Log::Write("пульт: " + result.error);
+                lastError = result.error;
+                pause(60);
+                continue;
+            }
+            lastError.clear();
+            if (result.url != shown) {
+                Telegram::PublishPhoneUrl(result.url);
+                const json answer = Call("setChatMenuButton", { { "chat_id", c.owner }, { "menu_button", { { "type", "web_app" }, { "text", "Пульт" }, { "web_app", { { "url", result.url } } } } } });
+                if (answer.is_object() && answer.value("ok", false)) shown = result.url;
+
+                // телефон может долго помнить старую кнопку меню — держим в чате одну свежую (без звука)
+                const std::string previous = Config::Value("telegram", "pult_message", "");
+                if (!previous.empty() && previous != "0") Call("deleteMessage", { { "chat_id", c.owner }, { "message_id", std::atoll(previous.c_str()) } });
+                Config::SetValue("telegram", "pult_message", "0");
+                if (Config::Value("telegram", "greet", "1") != "1") { // уведомления выключены — только кнопка меню, адрес всегда даст /pult
+                    std::lock_guard lock(g_mutex);
+                    g_pultUrl = result.url;
+                    pause(15);
+                    continue;
+                }
+                const json sent = Call("sendMessage", { { "chat_id", c.owner }, { "text", "📱 Пульт готов" }, { "disable_notification", true }, { "reply_markup", PultButton(result.url) } });
+                if (sent.is_object() && sent.value("ok", false)) {
+                    Config::SetValue("telegram", "pult_message", std::to_string(sent["result"].value("message_id", 0LL)));
+                    Log::Write("пульт: свежая кнопка в чате");
+                } else Log::Write("пульт: не получилось прислать кнопку");
+
+                std::lock_guard lock(g_mutex);
+                g_pultUrl = result.url;
+            }
+            pause(15);
+        }
+    }
+
+    // Красивая сводка: разделы, полоски загрузки, цветные температуры
+    std::string StatusText() {
+        const auto s = SystemMonitor::Snapshot();
+        if (!s.ready) return "⏳ Ещё собираю данные о компьютере";
+        char line[160];
+        std::string text = "<b>💻 Компьютер</b>\n\n";
+        snprintf(line, sizeof(line), "🧠 <b>Процессор</b> — %d%%%s\n<code>%s</code>\n", static_cast<int>(s.cpu), Temp(s.cpuTemp).c_str(), Bar(s.cpu).c_str());
+        text += line;
+        if (s.hasGpu) {
+            snprintf(line, sizeof(line), "🎮 <b>Видеокарта</b> — %d%%%s\n<code>%s</code>\n", static_cast<int>(s.gpu), Temp(s.gpuTemp).c_str(), Bar(s.gpu).c_str());
+            text += line;
+            snprintf(line, sizeof(line), "🎞 <b>Видеопамять</b> — %.1f из %.1f ГБ\n", s.vramUsedGb, s.vramTotalGb);
+            text += line;
+        }
+        snprintf(line, sizeof(line), "🧩 <b>Память</b> — %.1f из %.0f ГБ\n<code>%s</code> %d%%\n", s.ramUsedGb, s.ramTotalGb, Bar(s.ram).c_str(), static_cast<int>(s.ram));
+        text += line;
+        snprintf(line, sizeof(line), "💾 <b>Диск C</b> — свободно %.0f из %.0f ГБ\n", s.diskFreeGb, s.diskTotalGb);
+        text += line;
+
+        const auto track = MediaNow::Snapshot();
+        if (track.present) {
+            std::string title = track.title;
+            for (const char* ext : { ".mp3", ".flac", ".wav", ".m4a", ".ogg" }) // имя файла — без расширения и подчёркиваний
+                if (title.size() > strlen(ext) && title.compare(title.size() - strlen(ext), strlen(ext), ext) == 0) title.resize(title.size() - strlen(ext));
+            std::replace(title.begin(), title.end(), '_', ' ');
+            text += std::string("\n") + (track.playing ? "▶️ <b>Играет</b>" : "⏸ <b>На паузе</b>") + "\n🎵 " + Html(title) +
+                    (track.artist.empty() ? "" : " — <i>" + Html(track.artist) + "</i>") + (track.app.empty() ? "" : "\n<i>" + Html(track.app) + "</i>") + "\n";
+        }
+        text += "\n" + VolumeText();
+        if (PowerMode::IsStandby()) text += "\n\n🌙 <i>Экран выключен — я на связи</i>";
+        if (EcoMode::Active()) text += "\n\n🎮 <i>Включён игровой режим</i>";
+        return text;
+    }
+
+    void HandleText(long long chat, const std::string& raw) {
+        const std::string text = Text::Trim(raw);
+        const std::wstring lower = Text::LowerRu(Text::ToWide(text));
+        auto is = [&](const char* button, const wchar_t* command) { return text == button || text == Lang::TranslateText(button) || lower == command; };
+
+        if (lower == L"/start" || lower == L"/help" || lower == L"помощь") {
+            Reply(chat, "Привет! Я " + Config::Get().assistant + " 💜 Всё управление — в пульте: кнопка «Пульт» слева от поля ввода. А ещё можно писать мне как дома: «открой стим», "
+                        "«громкость 30», «какая погода», «реши задачу» — или прислать фото задачи.", Keyboard());
+            OpenPult(chat);
+            return;
+        }
+        if (chat != kPhoneChat && Security::TwoFactorEnabled()) { // телефон уже подтверждён привязкой и отпечатком
+            const bool sixDigits = text.size() == 6 && std::all_of(text.begin(), text.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
+            if (sixDigits && Security::AwaitingCode()) {
+                std::string message;
+                if (!Security::CheckCode(text, message)) { Reply(chat, message); return; }
+                Reply(chat, "Код принят, опасные команды открыты на 15 минут.");
+                const std::string command = Security::TakeCommand();
+                if (!command.empty()) HandleText(chat, command);
+                return;
+            }
+            const bool harmless = is(kStatus, L"/status") || is(kPause, L"/pause") || is(kNext, L"/next") || is(kLouder, L"/louder") || is(kQuieter, L"/quieter") ||
+                                  is(kLock, L"/lock") || is(kShowLock, L"/showlock") || is(kWake, L"/on");
+            if (!harmless && !Security::Passed()) {
+                Security::RememberCommand(text);
+                Reply(chat, "🔐 Пришли код из Google Authenticator, и я выполню команду.");
+                return;
+            }
+        }
+        if (lower == L"/apk" || lower == L"приложение" || lower == L"приложение для телефона") { std::thread(SendPhoneApp, chat).detach(); return; }
+        if (is(kAskScreen, L"/ask")) { std::thread(AskAboutScreen, chat).detach(); return; }
+        if (is(kDesktop, L"/desktop") || lower == L"/pult" || lower == L"пульт") { OpenPult(chat); return; }
+        if (text != kLouder && text != kQuieter && text != kPowerOff && text.rfind('/', 0) != 0 && !text.empty()) {
+            std::optional<PendingShot> shot;
+            {
+                std::lock_guard lock(g_mutex);
+                shot.swap(g_pendingShot);
+            }
+            if (shot && GetTickCount64() - shot->at < kPendingShotMs) {
+                std::thread(SolveShot, chat, std::move(shot->image), text).detach();
+                return;
+            }
+        }
+        if (is(kScreen, L"/screen") && !ScreenAllowed(chat)) return;
+        if (is(kScreen, L"/screen")) { Photo(chat, Screen::CaptureJpeg(0, 85), ""); return; }
+        if (is(kSolve, L"/solve") || (lower.find(L"реши") != std::wstring::npos && lower.find(L"экран") != std::wstring::npos)) {
+            std::thread(SolveScreen, chat, std::string()).detach();
+            return;
+        }
+        if (is(kStatus, L"/status")) { Reply(chat, StatusText(), json(), true); return; }
+        if (is(kLock, L"/lock")) { PowerMode::Lock(); return; } // ответ с новой кнопкой пришлёт OnLockChanged
+        if (is(kShowLock, L"/showlock")) {
+            PowerMode::Wake();
+            Reply(chat, "🔆 Включила экран — на нём экран блокировки. Войди в Windows за компьютером.");
+            return;
+        }
+        if (is(kPause, L"/pause")) { MediaNow::Control(MediaNow::Action::PlayPause); Reply(chat, "⏯"); return; }
+        if (is(kNext, L"/next")) { MediaNow::Control(MediaNow::Action::Next); Reply(chat, "⏭"); return; }
+        // шаг 8%: одно нажатие клавиши громкости Windows — 2%
+        if (is(kLouder, L"/louder")) { Input::Tap(VK_VOLUME_UP, 4); Reply(chat, VolumeText(), json(), true); return; }
+        if (is(kQuieter, L"/quieter")) { Input::Tap(VK_VOLUME_DOWN, 4); Reply(chat, VolumeText(), json(), true); return; }
+        if (is(kStandby, L"/off")) {
+            PowerMode::Standby();
+            Reply(chat, std::string("🌙 Экран выключен, звук тоже") + (Config::Value("telegram", "lock_on_standby", "0") == "1" ? ", компьютер заблокирован" : "") +
+                        ". Я на связи — напиши /on, когда понадобится.");
+            return;
+        }
+        if (lower == L"/eco") { Reply(chat, "🍃 " + EcoMode::Toggle()); return; }
+        if (lower == L"/eco_on") { Reply(chat, "🍃 " + EcoMode::Enable()); return; }
+        if (lower == L"/eco_off") { Reply(chat, "🍃 " + EcoMode::Disable()); return; }
+        if (is(kWake, L"/on")) { PowerMode::Wake(); Reply(chat, "☀ Включила экран и звук"); return; }
+        if (is(kPowerOff, L"/shutdown")) {
+            const json confirm = { { "inline_keyboard", json::array({ json::array({ { { "text", "Да, выключить" }, { "callback_data", "power_off" } },
+                                                                                      { { "text", "Перезагрузить" }, { "callback_data", "power_restart" } } }),
+                                                                        json::array({ { { "text", "Отмена" }, { "callback_data", "power_cancel" } } }) }) } };
+            Reply(chat, "Выключить компьютер совсем? Тогда и я отключусь — включить его с телефона уже не получится.", confirm);
+            return;
+        }
+        if (lower.rfind(L"скажи ", 0) == 0 || lower.rfind(L"/say ", 0) == 0) {
+            Voice::Speak(Text::ToUtf8(Text::ToWide(text).substr(lower.find(L' ') + 1)));
+            Reply(chat, "Сказала вслух 🗣");
+            return;
+        }
+
+        // всё остальное — как будто сказали Ане: сначала её навыки, иначе — нейросеть (тихо, ответом сюда)
+        if (const auto done = Skills::Handle(text)) { Reply(chat, *done); return; }
+        std::thread([chat, text] {
+            const bool task = Ai::LooksLikeTask(text);
+            if (task) Reply(chat, "Думаю над задачей… 🧠 Это займёт 1–3 минуты.");
+            const std::string answer = Ai::Quiet(text, "", task);
+            Reply(chat, answer.empty() ? "Нейросеть пока не готова — попробуй через минутку" : answer);
+        }).detach();
+    }
+
+    void HandleCallback(const json& query) {
+        const long long from = query["from"].value("id", 0LL);
+        const std::string data = query.value("data", "");
+        Call("answerCallbackQuery", { { "callback_query_id", query.value("id", "") } });
+        if (!Telegram::IsAllowedId(from)) return;
+        if (data != "power_cancel" && Security::TwoFactorEnabled() && !Security::Passed()) { Reply(from, "🔐 Код устарел. Напиши /shutdown и пришли код заново."); return; }
+        if (data == "power_off") { Reply(from, "Выключаю через 15 секунд. До встречи! 👋"); PowerMode::Shutdown(15); }
+        if (data == "power_restart") { Reply(from, "Перезагружаю через 15 секунд — вернусь, как только Windows запустит меня"); PowerMode::Restart(15); }
+        if (data == "power_cancel") { PowerMode::CancelShutdown(); Reply(from, "Отменила"); }
+    }
+
+    // Подключение аккаунта: ссылка одноразовая и живёт 5 минут, решение принимается только на компьютере
+    std::mutex g_linkMutex;
+    std::string g_linkNonce, g_linkName;
+    ULONGLONG g_linkUntil = 0;
+    long long g_linkId = 0;
+
+    bool TryAccountLink(long long chat, long long from, const json& message) {
+        const std::string text = message["text"].get<std::string>();
+        if (text.rfind("/start link_", 0) != 0) return false;
+        std::lock_guard lock(g_linkMutex);
+        if (g_linkNonce.empty() || GetTickCount64() > g_linkUntil || text.substr(12) != g_linkNonce) { Reply(chat, "Ссылка устарела. Нажми кнопку в настройках ещё раз."); return true; }
+        g_linkNonce.clear();
+        g_linkId = from;
+        const json& user = message["from"];
+        g_linkName = user.value("username", "").empty() ? user.value("first_name", "Telegram") : "@" + user.value("username", "");
+        Reply(chat, "Подтверди подключение на компьютере, в настройках ZAVIRIA.");
+        return true;
+    }
+
+    void HandleUpdate(const json& update, long long startedAt) {
+        if (update.contains("callback_query")) { HandleCallback(update["callback_query"]); return; }
+        if (!update.contains("message")) return;
+        const json& message = update["message"];
+        const long long chat = message["chat"].value("id", 0LL);
+        const long long from = message.contains("from") ? message["from"].value("id", 0LL) : 0;
+        if (message.value("date", 0LL) < startedAt - 120) return; // старые сообщения (пока Аня была закрыта) не выполняем
+
+        if (message.contains("text") && TryAccountLink(chat, from, message)) return;
+        if (!Telegram::IsAllowedId(from)) {
+            Log::Write("телеграм: чужой пользователь " + std::to_string(from) + " — отказ");
+            Reply(chat, "⛔ Это личный бот. У тебя нет доступа.");
+            return;
+        }
+        if (message.contains("photo")) { // фото задачи с телефона
+            const std::string caption = message.value("caption", "");
+            std::thread([chat, photos = message["photo"], caption] {
+                Reply(chat, "Смотрю на фото и думаю… 🧠 Это займёт 1–3 минуты.");
+                const std::string image = DownloadPhoto(photos);
+                const std::vector<uint8_t> bytes(image.begin(), image.end());
+                const std::string answer = image.empty() ? "" : Ai::Quiet(caption.empty() ? "Реши задачу на фото." : caption, Screen::Base64(bytes), true);
+                Reply(chat, answer.empty() ? "Не получилось прочитать фото" : answer);
+            }).detach();
+            return;
+        }
+        if (message.contains("text")) {
+            const std::string text = message["text"].get<std::string>();
+            Log::Write("телеграм: «" + text + "»");
+            HandleText(chat, text);
+        }
+    }
+
+    void Poll(int generation) {
+        const long long startedAt = static_cast<long long>(std::time(nullptr));
+        long long offset = 0;
+        bool greeted = false;
+        while (generation == g_generation.load()) {
+            const auto c = Current();
+            const std::string response = Http::HttpsGet(kHost, Path(c.token, "getUpdates") + L"?timeout=25&offset=" + std::to_wstring(offset), 35000);
+            if (generation != g_generation.load()) break;
+            const json data = json::parse(response, nullptr, false);
+            if (data.is_discarded() || !data.value("ok", false)) {
+                g_ready = false;
+                {
+                    std::lock_guard lock(g_mutex);
+                    g_status = response.empty() ? "нет связи с телеграмом" : data.value("error_code", 0) == 409 ? "этот бот уже запущен в другом месте" : "ошибка: " + (data.is_discarded() ? std::string("ответ не разобран") : data.value("description", "неизвестно"));
+                    Log::Write("телеграм: " + g_status);
+                }
+                Sleep(5000);
+                continue;
+            }
+            if (!g_ready.exchange(true)) {
+                const json me = Call("getMe", json::object());
+                std::lock_guard lock(g_mutex);
+                g_status = me.contains("result") ? "на связи как @" + me["result"].value("username", "бот") : "на связи";
+                Log::Write("телеграм: " + g_status);
+            }
+            if (!greeted) { // один раз за запуск — показать кнопки (если не выключено в настройках)
+                greeted = true;
+                if (Config::Value("telegram", "greet", "1") == "1") Reply(c.owner, Config::Get().assistant + " запущена и на связи 💜", Keyboard());
+                Config::SetValue("telegram", "keyboard", kKeyboardVersion);
+            }
+            for (const auto& update : data["result"]) {
+                offset = std::max(offset, update.value("update_id", 0LL) + 1);
+                try { HandleUpdate(update, startedAt); } catch (...) { Log::Write("телеграм: не смогла разобрать сообщение"); }
+            }
+        }
+    }
+}
+
+void Telegram::Start() { Reload(); }
+
+bool Telegram::StartAccountLink() {
+    const std::string status = Status();
+    const size_t at = status.find('@');
+    if (!Ready() || at == std::string::npos) return false;
+    const std::string nonce = Security::NewTwoFactorSecret().substr(0, 24);
+    {
+        std::lock_guard lock(g_linkMutex);
+        g_linkNonce = nonce;
+        g_linkUntil = GetTickCount64() + 5 * 60 * 1000;
+        g_linkId = 0;
+    }
+    ShellExecuteW(nullptr, L"open", Text::ToWide("https://t.me/" + status.substr(at + 1) + "?start=link_" + nonce).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    return true;
+}
+
+std::string Telegram::AccountRequest() {
+    std::lock_guard lock(g_linkMutex);
+    return g_linkId ? g_linkName : std::string();
+}
+
+void Telegram::AnswerAccountRequest(bool allow) {
+    long long id = 0;
+    { std::lock_guard lock(g_linkMutex); id = g_linkId; g_linkId = 0; }
+    if (id == 0) return;
+    if (!allow) { Reply(id, "Подключение отклонено."); return; }
+    if (!IsAllowedId(id)) {
+        const std::string list = Text::Trim(Config::Value("telegram", "owner", ""));
+        Config::SetValue("telegram", "owner", list.empty() ? std::to_string(id) : list + ", " + std::to_string(id));
+    }
+    Reply(id, "Аккаунт подключён ✅");
+    Reload();
+}
+
+bool Telegram::IsAllowedId(long long id) {
+    if (id == 0) return false;
+    const std::string list = Config::Value("telegram", "owner", "");
+    for (size_t at = 0; at < list.size();) {
+        size_t end = list.find_first_of(",; ", at);
+        if (end == std::string::npos) end = list.size();
+        if (end > at && std::atoll(list.substr(at, end - at).c_str()) == id) return true;
+        at = end + 1;
+    }
+    return false;
+}
+
+void Telegram::PhoneCommand(const std::string& text) {
+    std::thread([text] {
+        if (text == "phone:power_off") { Reply(kPhoneChat, "Выключаю компьютер через 15 секунд."); PowerMode::Shutdown(15); }
+        else if (text == "phone:power_restart") { Reply(kPhoneChat, "Перезагружаю компьютер через 15 секунд."); PowerMode::Restart(15); }
+        else if (text == "phone:power_cancel") { PowerMode::CancelShutdown(); Reply(kPhoneChat, "Отменила."); }
+        else HandleText(kPhoneChat, text);
+    }).detach();
+}
+
+std::string Telegram::PhoneTake() {
+    std::lock_guard lock(g_phoneMutex);
+    std::string out = g_phoneBox.dump();
+    g_phoneBox = json::array();
+    return out;
+}
+
+std::string Telegram::SendPhoneLink() {
+    const std::string url = PultUrl();
+    if (url.empty() || !Ready()) return {};
+    const std::string code = Security::OpenPhoneCode();
+    Reply(Current().owner, "Адрес для приложения ZAVIRIA. Скопируй это сообщение:\n" + url);
+    return code;
+}
+
+void Telegram::PublishPhoneUrl(const std::string& url) {
+    const std::string guard = Config::Value("phone", "guard", "");
+    if (guard.empty() || url.empty() || Config::Value("phone", "key", "").empty()) return;
+    const std::string sealed = Security::SealForPhone(url);
+    if (sealed.empty()) return;
+    std::thread([guard, sealed] { Http::HttpsPost(kHost, Text::ToWide("/bot" + guard + "/setMyDescription"), json{ { "description", sealed } }.dump(), "application/json", 15000); }).detach();
+}
+
+void Telegram::Reload() {
+    const std::string token = Text::Trim(Config::Value("telegram", "token", ""));
+    const long long owner = std::atoll(Config::Value("telegram", "owner", "").c_str()); // только этот пользователь
+    const bool enabled = Config::Value("telegram", "enabled", "1") == "1";
+    const int generation = ++g_generation;
+    g_ready = false;
+    RemoteDesktop::Stop(); // токен или владелец могли смениться
+    { std::lock_guard lock(g_mutex); g_pultUrl.clear(); }
+    {
+        std::lock_guard lock(g_mutex);
+        g_token = token;
+        g_owner = owner;
+        g_enabled = enabled && !token.empty() && owner != 0;
+        g_status = !enabled ? "выключен" : token.empty() ? "нет токена бота" : owner == 0 ? "не указан ID владельца" : "подключаюсь…";
+    }
+    if (enabled && !token.empty() && owner != 0) {
+        std::thread(Poll, generation).detach();
+        if (Config::Value("telegram", "remote_desktop", "1") == "1") std::thread(KeepPult, generation).detach();
+    }
+}
+
+bool Telegram::Ready() { return g_ready.load(); }
+
+std::string Telegram::Status() {
+    std::lock_guard lock(g_mutex);
+    return g_status;
+}
+
+bool Telegram::SendText(const std::string& text) {
+    if (!Ready()) return false;
+    Reply(Current().owner, text);
+    return true;
+}
+
+bool Telegram::SendPhoto(const std::vector<uint8_t>& jpeg, const std::string& caption) {
+    return Ready() && Photo(Current().owner, jpeg, caption);
+}
+
+void Telegram::OnLockChanged(bool locked) {
+    PowerMode::SetLocked(locked);
+    if (!Ready() || Config::Value("telegram", "greet", "1") != "1") return; // уведомления выключены
+    std::thread([locked] { // из оконной процедуры — сеть не ждём
+        Reply(Current().owner, locked ? "🔒 Компьютер заблокирован" : "🔓 Компьютер разблокирован");
+    }).detach();
+}
+
+void Telegram::SolveScreenAsync() {
+    if (!Ready()) return;
+    std::thread(SolveScreen, Current().owner, std::string()).detach();
+}
+
+void Telegram::SendScreenAsync() {
+    if (!Ready()) return;
+    std::thread([] { Photo(Current().owner, Screen::CaptureJpeg(0, 85), "Снимок экрана"); }).detach();
+}

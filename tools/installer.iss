@@ -1,25 +1,25 @@
-﻿; Установщик ASTRIX-Setup.exe. Собирается из чистой папки dist\ASTRIX: tools\make-release.ps1 -Installer
+﻿; Установщик ZAVIRIA-Setup.exe. Собирается из чистой папки dist\ZAVIRIA: tools\make-release.ps1 -Installer
 ; Ставится в профиль пользователя: Аня хранит настройки рядом с программой, в Program Files ей писать нельзя.
 
 #ifndef AppVer
-  #define AppVer "1.4"
+  #define AppVer "1.5"
 #endif
 
 [Setup]
 AppId={{7E3C1A52-9B46-4D1E-8F27-5A0C6D2B9E11}
-AppName=ASTRIX - Voice assistant
+AppName=ZAVIRIA - Voice assistant
 AppVersion={#AppVer}
-AppPublisher=ASTRIX
-AppPublisherURL=https://github.com/zephiro4ka/Voice-assistant-ASTRIX
-DefaultDirName={localappdata}\ASTRIX
+AppPublisher=ZAVIRIA
+AppPublisherURL=https://github.com/zephiro4ka/ZAVIRIA-Voice-assistant
+DefaultDirName={localappdata}\ZAVIRIA
 DisableProgramGroupPage=yes
 DisableDirPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
-OutputBaseFilename=ASTRIX-Engine
-SetupIconFile=..\assets\astrix.ico
+OutputBaseFilename=ZAVIRIA-Engine
+SetupIconFile=..\assets\zaviria.ico
 Compression=lzma2/fast
 SolidCompression=no
 WizardStyle=modern dark hidebevels
@@ -30,15 +30,15 @@ DisableWelcomePage=no
 DisableReadyMemo=yes
 WizardImageFile=..\assets\installer-side.bmp
 WizardSmallImageFile=..\assets\installer-top.bmp
-UninstallDisplayIcon={app}\ASTRIX.exe
-UninstallDisplayName=ASTRIX - Voice assistant
+UninstallDisplayIcon={app}\ZAVIRIA.exe
+UninstallDisplayName=ZAVIRIA - Voice assistant
 CloseApplications=yes
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 
 [Messages]
-russian.WelcomeLabel1=Привет! Сейчас установим ASTRIX
+russian.WelcomeLabel1=Привет! Сейчас установим ZAVIRIA
 russian.WelcomeLabel2=Ничего настраивать не нужно. Просто нажимай «Далее», всё нужное скачается само.%n%nПонадобится интернет и примерно 5 ГБ свободного места.
 russian.SelectTasksLabel2=Если не уверен, ничего не меняй и нажми «Далее».
 russian.ClickNext=
@@ -48,16 +48,17 @@ russian.WizardReady=Почти всё
 russian.ReadyLabel1=Осталось нажать одну кнопку
 russian.ReadyLabel2a=Нажми «Установить» и подожди. Можно пойти налить чай, если скорость интернета небольшая.
 russian.ReadyLabel2b=Нажми «Установить» и подожди. Можно пойти налить чай, если скорость интернета небольшая.
-russian.FinishedHeadingLabel=ASTRIX установлена!
+russian.FinishedHeadingLabel=ZAVIRIA установлена!
 russian.FinishedLabel=При первом запуске программа сама покажет, что и где находится.
 russian.FinishedLabelNoIcons=При первом запуске программа сама покажет, что и где находится.
 
 [Tasks]
 Name: "startmenu"; Description: "Добавить в меню Пуск"
 Name: "desktopicon"; Description: "Сделать значок на рабочем столе"
+Name: "autostart"; Description: "Запускать вместе с Windows"
 
 [Files]
-Source: "..\dist\ASTRIX\*"; DestDir: "{app}"; Excludes: "models\*"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "..\dist\ZAVIRIA\*"; DestDir: "{app}"; Excludes: "models\*"; Flags: recursesubdirs createallsubdirs ignoreversion
 ; скачанное при установке (если файл уже стоит или не скачался — пропускаем)
 Source: "{tmp}\ggml-small.bin"; DestDir: "{app}\models"; Flags: external skipifsourcedoesntexist ignoreversion
 Source: "{tmp}\cloudflared.exe"; DestDir: "{app}"; Flags: external skipifsourcedoesntexist ignoreversion
@@ -88,12 +89,17 @@ Source: "{tmp}\mmproj-Qwen3.5-4B-BF16.gguf"; DestDir: "{app}\models\q4"; Flags: 
 Source: "{tmp}\Qwen3.5-9B-Q4_K_M.gguf"; DestDir: "{app}\models\q9"; Flags: external skipifsourcedoesntexist ignoreversion
 Source: "{tmp}\mmproj-Qwen3.5-9B-BF16.gguf"; DestDir: "{app}\models\q9"; Flags: external skipifsourcedoesntexist ignoreversion
 
+[Registry]
+; автозапуск — как Autostart.cpp: запись Run «Anya» + отметка «включено» в StartupApproved (без неё Windows 11 запись пропускает)
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Anya"; ValueData: """{app}\ZAVIRIA.exe"" --autostart"; Tasks: autostart; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"; ValueType: binary; ValueName: "Anya"; ValueData: "02 00 00 00 00 00 00 00 00 00 00 00"; Tasks: autostart; Flags: uninsdeletevalue
+
 [Icons]
-Name: "{autoprograms}\ASTRIX"; Filename: "{app}\ASTRIX.exe"; WorkingDir: "{app}"; Tasks: startmenu
-Name: "{autodesktop}\ASTRIX"; Filename: "{app}\ASTRIX.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autoprograms}\ZAVIRIA"; Filename: "{app}\ZAVIRIA.exe"; WorkingDir: "{app}"; Tasks: startmenu
+Name: "{autodesktop}\ZAVIRIA"; Filename: "{app}\ZAVIRIA.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\ASTRIX.exe"; Description: "Запустить"; WorkingDir: "{app}"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\ZAVIRIA.exe"; Description: "Запустить"; WorkingDir: "{app}"; Flags: postinstall nowait skipifsilent
 
 [Code]
 var
@@ -206,7 +212,7 @@ begin
   Fetch('https://huggingface.co/Supertone/supertonic-3/resolve/main/voice_styles/M3.json', 'st_voice_styles_M3.json', 'ea1ac35ccb91b0d7ecad533a2fbd0eec10c91513d8951e3b25fbba99954e159b', '{app}\models\supertonic-3\voice_styles\M3.json', 'голос');
   Fetch('https://huggingface.co/Supertone/supertonic-3/resolve/main/voice_styles/M4.json', 'st_voice_styles_M4.json', 'ca8eefad4fcd989c9379032ff3e50738adc547eeb5e221b82593a6d7b3bac303', '{app}\models\supertonic-3\voice_styles\M4.json', 'голос');
   Fetch('https://huggingface.co/Supertone/supertonic-3/resolve/main/voice_styles/M5.json', 'st_voice_styles_M5.json', 'dd22b92740314321f8ae11c5e87f8dd60d060f15dd3a632b5adf77f471f77af2', '{app}\models\supertonic-3\voice_styles\M5.json', 'голос');
-  Fetch('https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe', 'cloudflared.exe', '', '{app}\cloudflared.exe', 'пульт в Telegram');
+  Fetch('https://github.com/cloudflare/cloudflared/releases/download/2026.10.7/cloudflared-windows-amd64.exe', 'cloudflared.exe', '2493dbc168923bb3e59e5e7716f71deced92992eea9acd6e9d74f84ac7751343', '{app}\cloudflared.exe', 'пульт в Telegram');
   if Choice = 0 then begin
     Fetch('https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf', 'Qwen3.5-0.8B-Q4_K_M.gguf', 'f5b14da98939b60bbe1019a964eba656407e1e0b64f1fe3003ff6d650e93bfec', '{app}\models\q08\Qwen3.5-0.8B-Q4_K_M.gguf', 'нейросеть');
     Fetch('https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-Qwen3.5-0.8B-BF16.gguf', 'mmproj-Qwen3.5-0.8B-BF16.gguf', '6fdd1b4bdc3d2ae8bd15d783e23260dd07dcf83f45604a21dabfd6efad8f8bc5', '{app}\models\q08\mmproj-Qwen3.5-0.8B-BF16.gguf', 'нейросеть');

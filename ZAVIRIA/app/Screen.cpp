@@ -1,0 +1,202 @@
+#include "Screen.h"
+
+#include "Com.h"
+#include "Platform.h"
+
+#include <wincodec.h>
+
+#include <algorithm>
+
+#pragma comment(lib, "windowscodecs.lib")
+
+namespace {
+    std::vector<RECT> AllMonitors() {
+        std::vector<RECT> list;
+        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR monitor, HDC, LPRECT, LPARAM param) -> BOOL {
+            MONITORINFO info{ sizeof(info) };
+            if (GetMonitorInfoW(monitor, &info)) reinterpret_cast<std::vector<RECT>*>(param)->push_back(info.rcMonitor);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&list));
+        std::sort(list.begin(), list.end(), [](const RECT& a, const RECT& b) { return a.left < b.left; });
+        return list;
+    }
+
+    // Пиксели области экрана (BGRA, сверху вниз)
+    bool Grab(const RECT& r, bool withCursor, std::vector<uint8_t>& pixels, int& width, int& height) {
+        width = r.right - r.left;
+        height = r.bottom - r.top;
+
+        HDC screen = GetDC(nullptr);
+        HDC memory = CreateCompatibleDC(screen);
+        BITMAPINFO bmi{};
+        bmi.bmiHeader = { sizeof(BITMAPINFOHEADER), width, -height, 1, 32, BI_RGB };
+        void* bits = nullptr;
+        HBITMAP bitmap = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        const bool ok = bitmap && bits;
+        if (ok) {
+            HGDIOBJ old = SelectObject(memory, bitmap);
+            BitBlt(memory, 0, 0, width, height, screen, r.left, r.top, SRCCOPY | CAPTUREBLT);
+            if (withCursor) {
+                CURSORINFO cursor{ sizeof(cursor) };
+                ICONINFO icon{};
+                if (GetCursorInfo(&cursor) && (cursor.flags & CURSOR_SHOWING) && GetIconInfo(cursor.hCursor, &icon)) {
+                    DrawIconEx(memory, cursor.ptScreenPos.x - r.left - static_cast<int>(icon.xHotspot), cursor.ptScreenPos.y - r.top - static_cast<int>(icon.yHotspot),
+                        cursor.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+                    if (icon.hbmColor) DeleteObject(icon.hbmColor);
+                    if (icon.hbmMask) DeleteObject(icon.hbmMask);
+                }
+            }
+            SelectObject(memory, old);
+            pixels.assign(static_cast<uint8_t*>(bits), static_cast<uint8_t*>(bits) + static_cast<size_t>(width) * height * 4);
+        }
+        if (bitmap) DeleteObject(bitmap);
+        DeleteDC(memory);
+        ReleaseDC(nullptr, screen);
+        return ok;
+    }
+
+    bool GrabActive(std::vector<uint8_t>& pixels, int& width, int& height) {
+        HMONITOR monitor = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO info{ sizeof(info) };
+        return GetMonitorInfoW(monitor, &info) && Grab(info.rcMonitor, false, pixels, width, height);
+    }
+}
+
+static std::vector<uint8_t> Encode(std::vector<uint8_t>& pixels, int width, int height, int maxWidth, int quality, bool fast = false);
+
+std::vector<uint8_t> Screen::CaptureJpeg(int maxWidth, int quality) {
+    std::vector<uint8_t> pixels;
+    int width = 0, height = 0;
+    if (!GrabActive(pixels, width, height)) return {};
+    return Encode(pixels, width, height, maxWidth, quality);
+}
+
+int Screen::MonitorCount() { return static_cast<int>(AllMonitors().size()); }
+
+bool Screen::Monitor(int index, MonitorArea& area) {
+    const auto list = AllMonitors();
+    if (index < 0 || index >= static_cast<int>(list.size())) return false;
+    const RECT r = list[index];
+    area = { r.left, r.top, r.right - r.left, r.bottom - r.top };
+    return true;
+}
+
+std::vector<uint8_t> Screen::CaptureMonitorJpeg(int index, int maxWidth, int quality) {
+    const auto list = AllMonitors();
+    if (index < 0 || index >= static_cast<int>(list.size())) return {};
+    std::vector<uint8_t> pixels;
+    int width = 0, height = 0;
+    if (!Grab(list[index], true, pixels, width, height)) return {};
+    return Encode(pixels, width, height, maxWidth, quality, true); // поток: скорость важнее идеального уменьшения
+}
+
+static std::vector<uint8_t> Encode(std::vector<uint8_t>& pixels, int width, int height, int maxWidth, int quality, bool fast) {
+    ComScope com;
+    Com<IWICImagingFactory> factory;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)))) return {};
+    Com<IWICBitmap> bitmap;
+    if (FAILED(factory->CreateBitmapFromMemory(width, height, GUID_WICPixelFormat32bppBGR, width * 4, static_cast<UINT>(pixels.size()),
+            pixels.data(), &bitmap)))
+        return {};
+
+    IWICBitmapSource* source = bitmap.p;
+    Com<IWICBitmapScaler> scaler;
+    UINT outWidth = width, outHeight = height;
+    if (maxWidth > 0 && width > maxWidth && SUCCEEDED(factory->CreateBitmapScaler(&scaler))) {
+        outWidth = maxWidth;
+        outHeight = static_cast<UINT>(static_cast<double>(height) * maxWidth / width);
+        if (SUCCEEDED(scaler->Initialize(bitmap.p, outWidth, outHeight, fast ? WICBitmapInterpolationModeLinear : WICBitmapInterpolationModeFant))) source = scaler.p;
+    }
+
+    Com<IStream> stream;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream))) return {};
+    Com<IWICBitmapEncoder> encoder;
+    Com<IWICBitmapFrameEncode> frame;
+    Com<IPropertyBag2> options;
+    if (FAILED(factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder)) || FAILED(encoder->Initialize(stream.p, WICBitmapEncoderNoCache)) ||
+        FAILED(encoder->CreateNewFrame(&frame, &options)))
+        return {};
+    PROPBAG2 option{};
+    option.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+    VARIANT value;
+    VariantInit(&value);
+    value.vt = VT_R4;
+    value.fltVal = std::clamp(quality, 10, 100) / 100.0f;
+    options->Write(1, &option, &value);
+    WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+    if (FAILED(frame->Initialize(options.p)) || FAILED(frame->SetSize(outWidth, outHeight)) || FAILED(frame->SetPixelFormat(&format)) ||
+        FAILED(frame->WriteSource(source, nullptr)) || FAILED(frame->Commit()) || FAILED(encoder->Commit()))
+        return {};
+
+    HGLOBAL memory = nullptr;
+    if (FAILED(GetHGlobalFromStream(stream.p, &memory))) return {};
+    STATSTG stat{};
+    stream->Stat(&stat, STATFLAG_NONAME);
+    const auto* data = static_cast<const uint8_t*>(GlobalLock(memory));
+    std::vector<uint8_t> jpeg(data, data + stat.cbSize.QuadPart);
+    GlobalUnlock(memory);
+    return jpeg;
+}
+
+std::string Screen::Base64(const std::vector<uint8_t>& data) {
+    static const char* kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((data.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < data.size(); i += 3) {
+        const uint32_t n = (data[i] << 16) | (i + 1 < data.size() ? data[i + 1] << 8 : 0) | (i + 2 < data.size() ? data[i + 2] : 0);
+        out += kAlphabet[(n >> 18) & 63];
+        out += kAlphabet[(n >> 12) & 63];
+        out += i + 1 < data.size() ? kAlphabet[(n >> 6) & 63] : '=';
+        out += i + 2 < data.size() ? kAlphabet[n & 63] : '=';
+    }
+    return out;
+}
+
+bool Screen::ClipboardHasImage() { return IsClipboardFormatAvailable(CF_BITMAP) || IsClipboardFormatAvailable(CF_DIB); }
+
+std::vector<uint8_t> Screen::ClipboardJpeg(int maxWidth, int quality) {
+    if (!ClipboardHasImage() || !OpenClipboard(nullptr)) return {};
+    std::vector<uint8_t> pixels;
+    int width = 0, height = 0;
+    if (HBITMAP bitmap = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP))) {
+        BITMAP info{};
+        if (GetObjectW(bitmap, sizeof(info), &info) && info.bmWidth > 0 && info.bmHeight > 0 && info.bmWidth < 20000 && info.bmHeight < 20000) {
+            width = info.bmWidth, height = info.bmHeight;
+            BITMAPINFO bmi{};
+            bmi.bmiHeader = { sizeof(BITMAPINFOHEADER), width, -height, 1, 32, BI_RGB };
+            pixels.resize(static_cast<size_t>(width) * height * 4);
+            HDC dc = GetDC(nullptr);
+            if (!GetDIBits(dc, bitmap, 0, static_cast<UINT>(height), pixels.data(), &bmi, DIB_RGB_COLORS)) pixels.clear();
+            ReleaseDC(nullptr, dc);
+        }
+    }
+    CloseClipboard();
+    if (pixels.empty()) return {};
+    return Encode(pixels, width, height, maxWidth, quality);
+}
+
+std::vector<uint8_t> Screen::FileJpeg(const std::wstring& path, int maxWidth, int quality) {
+    std::vector<uint8_t> pixels;
+    UINT width = 0, height = 0;
+    {
+        ComScope com;
+        Com<IWICImagingFactory> factory;
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)))) return {};
+        Com<IWICBitmapDecoder> decoder;
+        if (FAILED(factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder))) return {};
+        Com<IWICBitmapFrameDecode> frame;
+        if (FAILED(decoder->GetFrame(0, &frame))) return {};
+        Com<IWICFormatConverter> converter;
+        if (FAILED(factory->CreateFormatConverter(&converter)) ||
+            FAILED(converter->Initialize(frame.p, GUID_WICPixelFormat32bppBGR, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom))) return {};
+        if (FAILED(converter->GetSize(&width, &height)) || !width || !height || width > 16000 || height > 16000) return {};
+        pixels.resize(static_cast<size_t>(width) * height * 4);
+        if (FAILED(converter->CopyPixels(nullptr, width * 4, static_cast<UINT>(pixels.size()), pixels.data()))) return {};
+    }
+    return Encode(pixels, static_cast<int>(width), static_cast<int>(height), maxWidth, quality);
+}
+
+std::vector<uint8_t> Screen::EncodeJpeg(const uint8_t* bgra, int width, int height, int quality) {
+    std::vector<uint8_t> pixels(bgra, bgra + static_cast<size_t>(width) * height * 4);
+    return Encode(pixels, width, height, 0, quality);
+}
