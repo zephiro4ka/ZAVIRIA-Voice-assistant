@@ -450,25 +450,6 @@ namespace {
         if (data == "power_cancel") { PowerMode::CancelShutdown(); Reply(from, "Отменила"); }
     }
 
-    // Подключение аккаунта: ссылка одноразовая и живёт 5 минут, решение принимается только на компьютере
-    std::mutex g_linkMutex;
-    std::string g_linkNonce, g_linkName;
-    ULONGLONG g_linkUntil = 0;
-    long long g_linkId = 0;
-
-    bool TryAccountLink(long long chat, long long from, const json& message) {
-        const std::string text = message["text"].get<std::string>();
-        if (text.rfind("/start link_", 0) != 0) return false;
-        std::lock_guard lock(g_linkMutex);
-        if (g_linkNonce.empty() || GetTickCount64() > g_linkUntil || text.substr(12) != g_linkNonce) { Reply(chat, "Ссылка устарела. Нажми кнопку в настройках ещё раз."); return true; }
-        g_linkNonce.clear();
-        g_linkId = from;
-        const json& user = message["from"];
-        g_linkName = user.value("username", "").empty() ? user.value("first_name", "Telegram") : "@" + user.value("username", "");
-        Reply(chat, "Подтверди подключение на компьютере, в настройках ZAVIRIA.");
-        return true;
-    }
-
     void HandleUpdate(const json& update, long long startedAt) {
         if (update.contains("callback_query")) { HandleCallback(update["callback_query"]); return; }
         if (!update.contains("message")) return;
@@ -477,7 +458,6 @@ namespace {
         const long long from = message.contains("from") ? message["from"].value("id", 0LL) : 0;
         if (message.value("date", 0LL) < startedAt - 120) return; // старые сообщения (пока Аня была закрыта) не выполняем
 
-        if (message.contains("text") && TryAccountLink(chat, from, message)) return;
         if (!Telegram::IsAllowedId(from)) {
             Log::Write("телеграм: чужой пользователь " + std::to_string(from) + " — отказ");
             Reply(chat, "⛔ Это личный бот. У тебя нет доступа.");
@@ -540,39 +520,6 @@ namespace {
 }
 
 void Telegram::Start() { Reload(); }
-
-bool Telegram::StartAccountLink() {
-    const std::string status = Status();
-    const size_t at = status.find('@');
-    if (!Ready() || at == std::string::npos) return false;
-    const std::string nonce = Security::NewTwoFactorSecret().substr(0, 24);
-    {
-        std::lock_guard lock(g_linkMutex);
-        g_linkNonce = nonce;
-        g_linkUntil = GetTickCount64() + 5 * 60 * 1000;
-        g_linkId = 0;
-    }
-    ShellExecuteW(nullptr, L"open", Text::ToWide("https://t.me/" + status.substr(at + 1) + "?start=link_" + nonce).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    return true;
-}
-
-std::string Telegram::AccountRequest() {
-    std::lock_guard lock(g_linkMutex);
-    return g_linkId ? g_linkName : std::string();
-}
-
-void Telegram::AnswerAccountRequest(bool allow) {
-    long long id = 0;
-    { std::lock_guard lock(g_linkMutex); id = g_linkId; g_linkId = 0; }
-    if (id == 0) return;
-    if (!allow) { Reply(id, "Подключение отклонено."); return; }
-    if (!IsAllowedId(id)) {
-        const std::string list = Text::Trim(Config::Value("telegram", "owner", ""));
-        Config::SetValue("telegram", "owner", list.empty() ? std::to_string(id) : list + ", " + std::to_string(id));
-    }
-    Reply(id, "Аккаунт подключён ✅");
-    Reload();
-}
 
 bool Telegram::IsAllowedId(long long id) {
     if (id == 0) return false;

@@ -70,7 +70,8 @@ int Http::Remote(const std::string& url, const wchar_t* method, const std::strin
     return ReadResponse(request.h, onData);
 }
 
-std::string Http::HttpsPost(const wchar_t* host, const std::wstring& path, const std::string& body, const std::string& contentType, int timeoutMs) {
+std::string Http::HttpsPost(const wchar_t* host, const std::wstring& path, const std::string& body, const std::string& contentType, int timeoutMs,
+                            const std::wstring& extraHeaders) {
     Handle session{ WinHttpOpen(L"Anya/3.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0) };
     if (!session.h) return {};
     WinHttpSetTimeouts(session.h, 6000, 6000, timeoutMs, timeoutMs);
@@ -78,7 +79,7 @@ std::string Http::HttpsPost(const wchar_t* host, const std::wstring& path, const
     if (!connection.h) return {};
     Handle request{ WinHttpOpenRequest(connection.h, L"POST", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) };
     if (!request.h) return {};
-    const std::wstring headers = L"Content-Type: " + std::wstring(contentType.begin(), contentType.end()) + L"\r\n";
+    const std::wstring headers = L"Content-Type: " + std::wstring(contentType.begin(), contentType.end()) + L"\r\n" + extraHeaders;
     void* data = body.empty() ? nullptr : const_cast<char*>(body.data());
     const DWORD size = static_cast<DWORD>(body.size());
     if (!WinHttpSendRequest(request.h, headers.c_str(), static_cast<DWORD>(-1), data, size, size, 0)) return {};

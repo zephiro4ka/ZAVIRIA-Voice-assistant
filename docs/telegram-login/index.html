@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-ttao8HoWudFHnEMuLO2xuVFkdYv8e12qs0lWWQcruGw='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>ZAVIRIA</title>
+<style>
+  :root {
+    --bg: #f4f3f0; --card: #fbfaf8; --ink: #1d1c1a; --muted: #6b6862; --line: #e2dfd8; --accent: #2a8bd6;
+    --radius: 28px; --space: 40px; --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141416; --card: #1b1b1e; --ink: #ecebe8; --muted: #9a9893; --line: #2a2a2e; --accent: #4fa8ec; }
+  }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--ink); font: 16px/1.5 var(--font); }
+  main { max-width: 420px; margin: 24px; padding: var(--space); border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); }
+  h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: -.02em; }
+  p { margin: 0; color: var(--muted); }
+  i { display: block; width: 40px; height: 4px; margin-bottom: 24px; border-radius: 4px; background: var(--accent); }
+</style>
+</head>
+<body>
+<main><i></i><h1 id="t">Возвращаю в ZAVIRIA…</h1><p id="d">Секунду.</p></main>
+<script>
+(function () {
+  // Переходник: Telegram разрешает возврат только на https-адрес, а ZAVIRIA ждёт на 127.0.0.1.
+  // Код бесполезен без code_verifier и Client Secret — они есть только на компьютере.
+  var en = !/^ru\b/i.test(navigator.language || "");
+  var q = new URLSearchParams(location.search);
+  var state = q.get("state") || "", code = q.get("code") || "", error = q.get("error") || "";
+  var m = /^(\d{4,5})\.[A-Za-z0-9_-]{16,64}$/.exec(state);
+  var port = m ? +m[1] : 0;
+  function show(title, text) { document.getElementById("t").textContent = title; document.getElementById("d").textContent = text; }
+  if (!port || port < 1024 || port > 65535 || (!code && !error) || !/^[A-Za-z0-9._~-]{0,2048}$/.test(code) || !/^[a-z_]{0,64}$/.test(error)) {
+    show(en ? "Link expired" : "Ссылка устарела", en ? "Press “Sign in with Telegram” in ZAVIRIA again." : "Нажми «Войти через Telegram» в ZAVIRIA ещё раз.");
+    return;
+  }
+  if (en) show("Returning to ZAVIRIA…", "One second.");
+  var back = new URLSearchParams({ state: state });
+  if (code) back.set("code", code); else back.set("error", error);
+  history.replaceState(null, "", location.pathname); // код не остаётся в истории браузера
+  location.replace("http://127.0.0.1:" + port + "/telegram-login?" + back.toString());
+})();
+</script>
+</body>
+</html>

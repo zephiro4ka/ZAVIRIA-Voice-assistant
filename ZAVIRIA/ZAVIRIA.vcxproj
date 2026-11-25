@@ -237,6 +237,7 @@ xcopy /y /d /q /i "$(ProjectDir)fonts\*" "$(OutDir)fonts\"</Command>
     <ClInclude Include="app\MediaNow.h" />
     <ClInclude Include="app\HomeWidgets.h" />
     <ClInclude Include="app\Telegram.h" />
+    <ClInclude Include="app\TelegramLogin.h" />
     <ClInclude Include="app\RemoteDesktop.h" />
     <ClInclude Include="app\Pult.h" />
     <ClInclude Include="app\Rates.h" />
@@ -354,6 +355,7 @@ xcopy /y /d /q /i "$(ProjectDir)fonts\*" "$(OutDir)fonts\"</Command>
     <ClCompile Include="app\MediaNow.cpp" />
     <ClCompile Include="app\HomeWidgets.cpp" />
     <ClCompile Include="app\Telegram.cpp" />
+    <ClCompile Include="app\TelegramLogin.cpp" />
     <ClCompile Include="app\RemoteDesktop.cpp" />
     <ClCompile Include="app\Pult.cpp" />
     <ClCompile Include="app\Rates.cpp" />

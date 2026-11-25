@@ -18,6 +18,7 @@
 #include "Brain.h"
 #include "DiscordRpc.h"
 #include "Telegram.h"
+#include "TelegramLogin.h"
 #include "Wallpaper.h"
 #include "LookFile.h"
 #include "LocalAi.h"
@@ -112,7 +113,7 @@ namespace {
 
     char g_name[64] = "", g_spoken[64] = "", g_city[96] = "", g_toCollege[16] = "", g_backHome[16] = "";
     char g_prompt[1024] = "";
-    char g_token[128] = "", g_owner[256] = "", g_discordApp[32] = "";
+    char g_token[128] = "", g_owner[256] = "", g_discordApp[32] = "", g_loginSecret[128] = "";
 
     std::mutex g_cityMutex;
     std::string g_cityStatus; // «ищу…», «нашла: …», «не нашла»
@@ -1586,18 +1587,33 @@ namespace {
         if (!place.empty() && Widgets::Action("показать на карте", Widgets::Icon::Home)) ShellExecuteW(nullptr, L"open", Text::ToWide("https://www.google.com/maps?q=" + place).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
 
+    // Вход как «Войти с Google»: окно Telegram в браузере, на компьютере ничего подтверждать не нужно
     void DrawTelegramAccount(float) {
-        static std::string s_error;
-        const std::string request = Telegram::AccountRequest();
-        if (!request.empty()) {
-            ImGui::Text("%s хочет подключиться", request.c_str());
-            if (ImGui::Button("разрешить")) Telegram::AnswerAccountRequest(true);
-            ImGui::SameLine();
-            if (ImGui::Button("отклонить")) Telegram::AnswerAccountRequest(false);
+        static std::string s_error, s_seen = "?";
+        const std::string account = TelegramLogin::Account();
+        if (account != s_seen) { s_seen = account; Copy(g_owner, Config::Value("telegram", "owner", "")); } // «Кому можно» поменялся
+        const TelegramLogin::State state = TelegramLogin::Current();
+        if (state.phase == TelegramLogin::Phase::Waiting || state.phase == TelegramLogin::Phase::Checking) {
+            ImGui::TextDisabled("%s", Lang::Tr(state.phase == TelegramLogin::Phase::Waiting ? "Подтверди вход в открывшемся окне Telegram…" : "Проверяю вход…"));
+            if (state.phase == TelegramLogin::Phase::Waiting && Widgets::Action("отменить вход", Icon::Close)) TelegramLogin::Cancel();
             return;
         }
-        if (ImGui::Button("подключить аккаунт")) s_error = Telegram::StartAccountLink() ? "Нажми «Запустить» в открывшемся боте." : "Сначала подключи Telegram-бота: он сейчас не на связи.";
-        if (!s_error.empty()) ImGui::TextDisabled("%s", s_error.c_str());
+        if (!account.empty()) {
+            StatusLine(std::string(Lang::Tr("Вошла как")) + " " + account, true);
+            if (Widgets::Action("выйти", Icon::Close)) { TelegramLogin::SignOut(); s_error.clear(); }
+            return;
+        }
+        if (Widgets::Action("Войти через Telegram", Icon::Send, Widgets::ActionStyle::Primary)) {
+            std::string error;
+            s_error = TelegramLogin::Begin(error) ? std::string() : error;
+        }
+        const std::string& shown = state.phase == TelegramLogin::Phase::Failed && s_error.empty() ? state.message : s_error;
+        if (!shown.empty()) ImGui::TextDisabled("%s", Lang::Tr(shown.c_str()));
+    }
+
+    void DrawTelegramSecret(float w) {
+        IniText("##loginSecret", g_loginSecret, sizeof(g_loginSecret), "telegram", "login_secret", "Client Secret из @BotFather → Login Widget", w, [] {}, ImGuiInputTextFlags_Password);
+        if (Widgets::Action("скопировать адрес входа", Icon::Layers)) ImGui::SetClipboardText(TelegramLogin::kRedirect);
     }
 
     void DrawPhoneExpand(float w) {
@@ -1639,7 +1655,8 @@ namespace {
                                        "«выключить, но остаться на связи».", DrawTelegramExpand, true },
         { SecurityLink, "Токен бота", "Выдаёт @BotFather. Никому не показывай — с ним можно управлять ботом.", DrawTelegramToken },
         { SecurityLink, "Кому можно", "Один ID или несколько через запятую. У каждого будет полное управление компьютером, всем остальным бот откажет.", DrawTelegramOwner },
-        { SecurityLink, "Аккаунт Telegram", "Подключишь свой аккаунт без поиска ID.", DrawTelegramAccount },
+        { SecurityLink, "Вход через Telegram", "Как «Войти с Google»: подтверди вход в Telegram, и аккаунт сам появится в «Кому можно». ID искать не нужно.", DrawTelegramAccount },
+        { SecurityLink, "Ключ входа", "Client Secret из @BotFather → твой бот → Login Widget. Там же в Allowed URLs добавь адрес входа — кнопка ниже его скопирует.", DrawTelegramSecret },
         { SecurityLink, "Код для опасных команд", "Выключение, рабочий стол, снимок экрана и свободные команды боту будут требовать код из Google Authenticator. Код действует 15 минут.", DrawTwoFactor },
         { SecurityLink, "Уведомления в телеграме", "Сообщения, которые бот шлёт сам: запуск, свежая кнопка пульта, блокировка компьютера. Выключено — бот пишет только в ответ.", DrawGreet, true },
         { SecurityLink, "Пульт в телеграме", "Приложение в меню бота: быстрые команды, запуск программ и удалённый рабочий стол. Вход только для владельца. "
@@ -2024,10 +2041,10 @@ namespace {
             { "3. Он спросит имя. Напиши любое, например ZAVIRIA.", nullptr, nullptr, nullptr },
             { "4. Потом спросит ник. В конце обязательно bot, например sasha_zaviria_bot. Занят — придумай другой.", nullptr, nullptr, nullptr },
             { "5. Придёт сообщение с длинным кодом вида 123456:ABC… Скопируй код и вставь сюда:", "Токен бота", nullptr, nullptr },
-            { "6. Открой бота, который скажет твой номер, и нажми «Запустить».", nullptr, "https://t.me/userinfobot", "userinfobot" },
-            { "7. Скопируй цифры рядом с Id и вставь сюда:", "Кому можно", nullptr, nullptr },
-            { "8. Открой своего бота и нажми «Запустить». Всё! Слева от поля ввода появится кнопка «Пульт».", nullptr, nullptr, nullptr },
-            { "Код бота — как пароль. Никому его не показывай.", nullptr, nullptr, nullptr } };
+            { "6. В @BotFather открой своего бота → Login Widget. В Allowed URLs добавь адрес входа (кнопка «скопировать адрес входа»).", "Ключ входа", nullptr, nullptr },
+            { "7. Там же скопируй Client Secret и вставь сюда:", "Ключ входа", nullptr, nullptr },
+            { "8. Нажми «Войти через Telegram» и подтверди вход. Всё! Слева от поля ввода появится кнопка «Пульт».", "Вход через Telegram", nullptr, nullptr },
+            { "Код бота и Client Secret — как пароли. Никому их не показывай.", nullptr, nullptr, nullptr } };
         static const GuideRow kDiscord[] = {
             { "1. Открой страницу Discord и войди в свой аккаунт.", nullptr, "https://discord.com/developers/applications", "страницу Discord" },
             { "2. Справа вверху нажми синюю кнопку New Application.", nullptr, nullptr, nullptr },
@@ -2134,7 +2151,7 @@ namespace {
     bool g_more[kSections] = {};
     bool Collapsed(const char* title) { // эти пункты живут внутри меню своего раздела и открываются стрелочкой
         const std::string name = title;
-        if (name == "Токен бота" || name == "Кому можно" || name == "Уведомления в телеграме" || name == "Пульт в телеграме" ||
+        if (name == "Токен бота" || name == "Ключ входа" || name == "Кому можно" || name == "Уведомления в телеграме" || name == "Пульт в телеграме" ||
             name == "Снимки экрана" || name == "Блокировать при «Выключить»") return !g_openTelegram;
         if (name == "ID приложения Discord" || name == "Показывать музыку" || name == "Показывать видео") return !g_openDiscord;
         if (name == "Адрес API" || name == "Ключ API" || name == "Модель в облаке" || name == "Проверить облако") return !CloudToggle();
@@ -2455,6 +2472,7 @@ namespace {
         Copy(g_backHome, Config::Value("weather", "back_home", "15:10"));
         Copy(g_token, Config::Value("telegram", "token", ""));
         Copy(g_owner, Config::Value("telegram", "owner", ""));
+        Copy(g_loginSecret, Config::Value("telegram", "login_secret", ""));
         Copy(g_discordApp, Config::Value("discord", "app_id", ""));
         Copy(g_cloudUrl, Config::Value("ai", "cloud_url", ""));
         Copy(g_cloudKey, Config::Value("ai", "cloud_key", ""));

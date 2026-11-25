@@ -21,7 +21,7 @@ namespace Http {
 
     // POST по HTTPS (телеграм): тело и его тип («application/json», «multipart/form-data; boundary=…»). Ответ или пусто.
     std::string HttpsPost(const wchar_t* host, const std::wstring& path, const std::string& body, const std::string& contentType,
-                          int timeoutMs = 20000);
+                          int timeoutMs = 20000, const std::wstring& extraHeaders = L"");
 
     // GET по полному адресу http(s)://… (страницы и API для поиска ответов). Тело (не больше ~2 МБ) или пусто.
     std::string Get(const std::string& url, int timeoutMs = 8000);

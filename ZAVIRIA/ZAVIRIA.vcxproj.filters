@@ -491,6 +491,9 @@
     <ClCompile Include="app\Telegram.cpp">
       <Filter>Аня</Filter>
     </ClCompile>
+    <ClCompile Include="app\TelegramLogin.cpp">
+      <Filter>Аня</Filter>
+    </ClCompile>
     <ClCompile Include="app\RemoteDesktop.cpp">
       <Filter>Аня</Filter>
     </ClCompile>
@@ -564,6 +567,9 @@
       <Filter>Аня</Filter>
     </ClInclude>
     <ClInclude Include="app\Telegram.h">
+      <Filter>Аня</Filter>
+    </ClInclude>
+    <ClInclude Include="app\TelegramLogin.h">
       <Filter>Аня</Filter>
     </ClInclude>
     <ClCompile Include="app\PowerMode.cpp">

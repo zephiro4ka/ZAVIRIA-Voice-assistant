@@ -182,7 +182,7 @@ void Config::Save() {
 static void ForgetValue(const char* section, const char* key);
 static bool IsSecret(const char* section, const char* key) {
     const std::string s(section), k(key);
-    return (s == "telegram" && (k == "token" || k == "totp_secret")) || (s == "phone" && (k == "key" || k == "guard" || k == "backup")) ||
+    return (s == "telegram" && (k == "token" || k == "totp_secret" || k == "login_secret")) || (s == "phone" && (k == "key" || k == "guard" || k == "backup")) ||
            (s == "ai" && k == "cloud_key");
 }
 

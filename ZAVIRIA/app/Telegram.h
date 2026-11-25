@@ -22,11 +22,6 @@ namespace Telegram {
     void OnLockChanged(bool locked); // Windows заблокирована/разблокирована — обновить кнопки у владельца
     void SendScreenAsync();
 
-    // Подключение аккаунта Telegram: кнопка в настройках → бот → подтверждение на компьютере
-    bool StartAccountLink();          // откроет бота в Telegram; false — бот не на связи
-    std::string AccountRequest();     // кто просит подключиться, пусто — никто
-    void AnswerAccountRequest(bool allow);
-
     // Приложение на телефоне: те же команды, что у бота, ответы забирает само
     void PhoneCommand(const std::string& text);
     std::string PhoneTake();                 // ответы JSON-массивом
