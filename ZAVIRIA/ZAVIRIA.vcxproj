@@ -220,6 +220,7 @@ xcopy /y /d /q /i "$(ProjectDir)fonts\*" "$(OutDir)fonts\"</Command>
     <ClInclude Include="app\Brain.h" />
     <ClInclude Include="app\Knowledge.h" />
     <ClInclude Include="app\Ears.h" />
+    <ClInclude Include="app\SpeechHealth.h" />
     <ClInclude Include="app\Graphics.h" />
     <ClInclude Include="app\Chatter.h" />
     <ClInclude Include="app\Input.h" />
@@ -334,6 +335,7 @@ xcopy /y /d /q /i "$(ProjectDir)fonts\*" "$(OutDir)fonts\"</Command>
     <ClCompile Include="ZAVIRIA.cpp" />
     <ClCompile Include="app\Brain.cpp" />
     <ClCompile Include="app\Ears.cpp" />
+    <ClCompile Include="app\SpeechHealth.cpp" />
     <ClCompile Include="app\Graphics.cpp" />
     <ClCompile Include="app\Chatter.cpp" />
     <ClCompile Include="app\Input.cpp" />

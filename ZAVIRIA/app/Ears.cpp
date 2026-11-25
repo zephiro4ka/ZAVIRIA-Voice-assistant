@@ -11,6 +11,7 @@
 #include "Log.h"
 #include "Settings.h"
 #include "SileroVoice.h"
+#include "SpeechHealth.h"
 #include "State.h"
 #include "TextUtils.h"
 #include "Voice.h"
@@ -23,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <thread>
@@ -48,6 +50,9 @@ namespace {
     constexpr Clock kMinSpeechMs = 350;                 // короче — не речь (но может быть кашлем или чихом)
     constexpr Clock kMinBurstMs = 150;                  // ещё короче — щелчок, даже не смотрим
     constexpr Clock kArmTimeoutMs = 8000;               // «говори» без речи — сдаёмся
+    constexpr Clock kStrikeMinMs = 700;                 // самопроверка распознавания: только фразы не короче этого
+    constexpr float kStrikeConfidence = 0.3f;           // уверенность ниже — фраза считается неразобранной
+    constexpr int kStrikes = 4;                         // столько неразобранных фраз подряд — меняем модель
 
     std::thread g_thread;
     std::atomic<float> g_confidence{ 1.0f }; // насколько модель уверена в последней фразе
@@ -68,12 +73,38 @@ namespace {
     }
     std::mutex g_inputMutex;
     std::vector<float> g_input; // сэмплы из колбэка микрофона
+    // Сторож микрофона: когда пришёл последний звук и было ли в нём с открытия хоть что-то, кроме ровных нулей.
+    // Одни нули с самого начала — микрофон выключен кнопкой или закрыт доступ к нему. Если звук уже был, нули — это
+    // шумодав между фразами, а не поломка: о таком не сообщаем
+    std::atomic<Clock> g_micDataAt{ 0 };
+    std::atomic<bool> g_micHeard{ false };
+    constexpr Clock kMicStalledMs = 3000;   // звук перестал приходить — устройство пропало
+    constexpr Clock kMicSilentMs = 15000;   // столько ровной тишины с открытия — микрофон «немой»
+    constexpr Clock kMicRetryMs = 3000;     // как часто искать микрофон, пока его нет
 
     void OnMicData(ma_device*, void*, const void* input, ma_uint32 frames) {
         if (!input || frames == 0) return;
         const float* samples = static_cast<const float*>(input);
+        g_micDataAt = NowMs();
+        if (!g_micHeard.load(std::memory_order_relaxed) && std::any_of(samples, samples + frames, [](float v) { return v != 0.0f; })) g_micHeard = true;
         std::lock_guard lock(g_inputMutex);
         if (g_input.size() < kSampleRate * 5) g_input.insert(g_input.end(), samples, samples + frames);
+    }
+
+    // Модели, от которых отказались в этом запуске: не прошли проверку или раз за разом не разбирали речь
+    std::mutex g_skipMutex;
+    std::vector<std::wstring> g_sessionSkip;
+    bool Skipped(const std::wstring& path) {
+        {
+            std::lock_guard lock(g_skipMutex);
+            if (std::find(g_sessionSkip.begin(), g_sessionSkip.end(), path) != g_sessionSkip.end()) return true;
+        }
+        return SpeechHealth::IsBroken(path);
+    }
+    void SkipForSession(const std::wstring& path, bool skip) {
+        std::lock_guard lock(g_skipMutex);
+        std::erase(g_sessionSkip, path);
+        if (skip) g_sessionSkip.push_back(path);
     }
 
     std::wstring FindModelFile(const wchar_t* only = nullptr) {
@@ -89,7 +120,7 @@ namespace {
                 for (const wchar_t* name : kNames) {
                     const std::wstring path = dir + sub + L"\\" + name;
                     const DWORD attributes = GetFileAttributesW(path.c_str());
-                    if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY)) return path;
+                    if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY) && (only || !Skipped(path))) return path;
                 }
             }
             const size_t slash = dir.find_last_of(L"\\/");
@@ -106,6 +137,8 @@ namespace {
     size_t g_draftSamples = 0;
     std::atomic<float> g_draftConfidence{ 1.0f };
     std::atomic<bool> g_liveWanted{ false }, g_liveBusy{ false }, g_reload{ false };
+    std::atomic<bool> g_unreliable{ false };  // перезагрузка из-за плохих результатов, а не по выбору в настройках
+    std::atomic<bool> g_decodeFailed{ false }; // последнее итоговое распознавание упало с ошибкой whisper
 
     // Чище звук для whisper — почти бесплатно по сравнению с самим распознаванием:
     // убрать постоянную составляющую и гул ниже ~90 Гц (вентилятор, сеть, удары по столу), отрезать тишину перед фразой
@@ -257,7 +290,8 @@ namespace {
                                             [&](int t) { return whisper_full_get_token_data_from_state(state, 0, t).p; });
             return DropRepeats(Text::Trim(draft));
         }
-        if (whisper_full(ctx, p, pcm.data(), static_cast<int>(pcm.size())) != 0) return {};
+        g_decodeFailed = whisper_full(ctx, p, pcm.data(), static_cast<int>(pcm.size())) != 0;
+        if (g_decodeFailed) return {};
         std::string text;
         double sureSum = 0.0;
         int sureCount = 0;
@@ -327,8 +361,10 @@ namespace {
     };
 
     // Распознать фразу: GigaAM-v3 через сервер голоса (точнее), иначе — whisper (грузится только если нужен)
-    std::string Recognize(whisper_context*& ctx, const std::wstring& modelPath, std::vector<float>& pcm) {
+    std::string Recognize(whisper_context*& ctx, const std::wstring& modelPath, std::vector<float>& pcm, bool* viaWhisper = nullptr) {
+        if (viaWhisper) *viaWhisper = false;
         if (auto text = SileroVoice::Recognize(pcm)) return *text;
+        if (viaWhisper) *viaWhisper = true;
         if (!ctx) {
             whisper_context_params params = whisper_context_default_params();
             params.use_gpu = false;
@@ -372,54 +408,168 @@ namespace {
         while (g_liveBusy.load()) Sleep(2);
     }
 
-    void Run() {
-        std::wstring modelPath = FindModelFile();
-        if (modelPath.empty()) {
-            Chat::Add(Role::System, "Не найдена модель whisper (ggml-small.bin). Положи её в папку models рядом с проектом.");
-            Caption::Set("нет модели распознавания — можно писать текстом");
-            return;
-        }
+    std::string FileName(const std::wstring& path) { return Text::ToUtf8(std::filesystem::path(path).filename().wstring()); }
+    std::wstring ChosenModel() { return FindModelFile(Text::ToWide(Config::Value("ears", "model", "ggml-small.bin")).c_str()); }
 
-        Caption::Set("просыпаюсь…");
-        whisper_context_params params = whisper_context_default_params();
-        params.use_gpu = false;
-        whisper_context* ctx = whisper_init_from_file_with_params(Text::ToUtf8(modelPath).c_str(), params);
-        if (!ctx) {
-            Chat::Add(Role::System, "Не удалось загрузить модель whisper.");
-            return;
-        }
-        { // прогрев: первая фраза распознаётся так же быстро, как остальные
-            std::vector<float> silence(kSampleRate, 0.0f);
-            Transcribe(ctx, silence);
-        }
+    // Самопроверка модели после загрузки, заодно прогрев: первая фраза распознаётся так же быстро, как остальные.
+    // hard — модель негодна совсем (запоминаем); иначе просто медленная, ею пользуемся, если другой нет
+    struct Verdict { std::string problem; bool hard = false; };
+    constexpr Clock kSlowModelMs = 20000; // секунда тишины дольше этого — фразы будут ждать ответа вечность
+    Verdict SelfTest(whisper_context* ctx) {
+        if (!whisper_is_multilingual(ctx) && (Lang::AutoSpeech() || std::string(Lang::Code()) != "en"))
+            return { "понимает только английский", true };
+        std::vector<float> silence(kSampleRate, 0.0f);
+        const Clock start = NowMs();
+        Transcribe(ctx, silence);
+        if (g_decodeFailed.load()) return { "whisper не смог распознать звук", true };
+        if (const Clock took = NowMs() - start; took > kSlowModelMs)
+            return { "слишком медленная для этого компьютера (" + std::to_string(took / 1000) + " с на секунду звука)", false };
+        return {};
+    }
 
-        whisper_state* liveState = whisper_init_state(ctx);
-        std::thread live(LiveLoop, &ctx, &liveState);
+    // Первая модель, которая загрузится и пройдёт проверку: выбранная, потом остальные по очереди.
+    // announce — сказать человеку, если работает не выбранная
+    whisper_context* LoadWorkingModel(std::wstring& path, bool announce) {
+        auto load = [](const std::wstring& file) {
+            whisper_context_params params = whisper_context_default_params();
+            params.use_gpu = false;
+            return whisper_init_from_file_with_params(Text::ToUtf8(file).c_str(), params);
+        };
+        std::wstring slow; // медленная, но рабочая — на случай, если быстрее ничего нет
+        whisper_context* ctx = nullptr;
+        for (int attempt = 0; attempt < 12 && !ctx; ++attempt) {
+            const std::wstring candidate = FindModelFile();
+            if (candidate.empty()) break;
+            whisper_context* loaded = load(candidate);
+            const Verdict verdict = loaded ? SelfTest(loaded) : Verdict{ "файл не загрузился: повреждён или не той версии", true };
+            if (verdict.problem.empty()) { ctx = loaded; path = candidate; break; }
+            if (loaded) whisper_free(loaded);
+            if (verdict.hard) SpeechHealth::MarkBroken(candidate, verdict.problem);
+            else {
+                Log::Write("распознавание: " + FileName(candidate) + " — " + verdict.problem);
+                if (slow.empty()) slow = candidate;
+            }
+            SkipForSession(candidate, true);
+        }
+        if (!ctx && !slow.empty()) { // лучше медленно, чем никак
+            SkipForSession(slow, false);
+            if ((ctx = load(slow))) {
+                path = slow;
+                std::vector<float> silence(kSampleRate, 0.0f);
+                Transcribe(ctx, silence);
+            }
+        }
+        if (!ctx) return nullptr;
+        Log::Write("распознавание: модель " + FileName(path));
+        if (announce) {
+            const std::wstring chosen = ChosenModel();
+            if (!chosen.empty() && chosen != path) SpeechHealth::Report(SpeechHealth::Issue::ModelReplaced, FileName(path));
+        }
+        return ctx;
+    }
 
+    // Микрофон: сначала выбранный в системе, потом любой другой, который откроется
+    bool OpenMic(ma_context& context, ma_device& device) {
         ma_device_config config = ma_device_config_init(ma_device_type_capture);
         config.capture.format = ma_format_f32;
         config.capture.channels = 1;
         config.sampleRate = kSampleRate;
         config.periodSizeInFrames = kFrame;
         config.dataCallback = OnMicData;
-        ma_device device;
-        if (ma_device_init(nullptr, &config, &device) != MA_SUCCESS || ma_device_start(&device) != MA_SUCCESS) {
-            Chat::Add(Role::System, "Не удалось открыть микрофон. Проверь разрешения Windows и устройство ввода.");
-            Caption::Set("микрофон недоступен — можно писать текстом");
-            StopLive();
-            g_app.running ? live.detach() : live.join();
-            return;
+        std::vector<std::pair<ma_device_id, std::string>> others;
+        ma_device_info* captures = nullptr;
+        ma_uint32 count = 0;
+        if (ma_context_get_devices(&context, nullptr, nullptr, &captures, &count) == MA_SUCCESS && captures)
+            for (ma_uint32 i = 0; i < count; ++i) others.emplace_back(captures[i].id, captures[i].name);
+        for (size_t i = 0; i <= others.size(); ++i) {
+            config.capture.pDeviceID = i == 0 ? nullptr : &others[i - 1].first;
+            if (ma_device_init(&context, &config, &device) != MA_SUCCESS) continue;
+            if (ma_device_start(&device) == MA_SUCCESS) {
+                if (i > 0) Log::Write("микрофон: системный не открылся, слушаю «" + others[i - 1].second + "»");
+                return true;
+            }
+            ma_device_uninit(&device);
         }
+        return false;
+    }
 
-        g_app.audioReady = true;
-        Caption::Set(Config::Get().wakeWord ? "скажи «" + Config::Get().assistant + "» и вопрос — или нажми на сферу" : std::string("нажми на сферу или пробел — и говори"));
+    void Run() {
+        std::wstring modelPath;
+        whisper_context* ctx = nullptr;
+        // Ни одной рабочей модели — ждём, пока её скачают или выберут в настройках
+        while (g_app.running && !(ctx = LoadWorkingModel(modelPath, true))) {
+            SpeechHealth::Report(SpeechHealth::Issue::NoModel);
+            while (g_app.running && !g_reload.exchange(false)) Sleep(200);
+            { std::lock_guard lock(g_skipMutex); g_sessionSkip.clear(); }
+            if (const std::wstring chosen = ChosenModel(); !chosen.empty()) SpeechHealth::Forget(chosen);
+        }
+        if (!ctx) return;
+        SpeechHealth::Resolved(SpeechHealth::Issue::NoModel);
+
+        whisper_state* liveState = whisper_init_state(ctx);
+        std::thread live(LiveLoop, &ctx, &liveState);
+
+        // Микрофона может не быть сейчас и появиться потом: ищем его, пока работаем, и замечаем, если пропал
+        ma_context audio;
+        bool audioContext = ma_context_init(nullptr, 0, nullptr, &audio) == MA_SUCCESS;
+        ma_device device;
+        bool micOpen = audioContext && OpenMic(audio, device);
+        Clock micRetryAt = 0, micCheckedAt = 0, micOpenedAt = 0;
+        int micStalls = 0; // открытий подряд, после которых звук так и не пошёл
+        auto micStarted = [&] {
+            g_micDataAt = micOpenedAt = NowMs();
+            g_micHeard = false;
+            g_app.audioReady = true;
+        };
+        if (micOpen) {
+            micStarted();
+            Caption::Set(Config::Get().wakeWord ? "скажи «" + Config::Get().assistant + "» и вопрос — или нажми на сферу" : std::string("нажми на сферу или пробел — и говори"));
+        } else {
+            SpeechHealth::Report(SpeechHealth::Issue::NoMicrophone);
+            micRetryAt = NowMs() + kMicRetryMs;
+        }
 
         VoiceDetector vad;
         std::vector<float> pending;
         Clock liveShared = 0;
+        int strikes = 0; // обращённые к ней фразы подряд, которые whisper не разобрал
 
         while (g_app.running) {
             Sleep(15);
+            if (const Clock now = NowMs(); now - micCheckedAt >= 500) {
+                micCheckedAt = now;
+                const bool flowing = micOpen && g_micDataAt.load() > micOpenedAt; // после открытия звук уже приходил
+                if (micOpen && now - g_micDataAt.load() > kMicStalledMs) { // звук перестал приходить: выдернули, отключили, компьютер спал
+                    ma_device_uninit(&device);
+                    micStalls = flowing ? 1 : micStalls + 1;
+                    micOpen = micStalls < 3 && OpenMic(audio, device); // открывается, но молчит раз за разом — устройство неисправно
+                    if (micOpen) { micStarted(); Log::Write("микрофон: переподключаюсь"); }
+                    else {
+                        g_app.audioReady = false;
+                        g_app.capturing = false;
+                        g_liveWanted = false;
+                        vad.Reset();
+                        SpeechHealth::Report(micStalls >= 3 ? SpeechHealth::Issue::NoMicrophone : SpeechHealth::Issue::MicrophoneLost);
+                        micRetryAt = now + kMicRetryMs * std::max(std::min(micStalls, 10), 1);
+                    }
+                } else if (!micOpen && now >= micRetryAt) {
+                    if (!audioContext) audioContext = ma_context_init(nullptr, 0, nullptr, &audio) == MA_SUCCESS;
+                    micOpen = audioContext && OpenMic(audio, device);
+                    if (micOpen) { micStarted(); Log::Write("микрофон: пробую открыть снова"); }
+                    else micRetryAt = now + kMicRetryMs * std::max(std::min(micStalls, 10), 1);
+                } else if (flowing && micStalls >= 0) {
+                    if (micStalls > 0) Log::Write("микрофон: работает");
+                    micStalls = -1; // -1 — уже сообщили, что всё хорошо
+                    SpeechHealth::Resolved(SpeechHealth::Issue::NoMicrophone);
+                    SpeechHealth::Resolved(SpeechHealth::Issue::MicrophoneLost);
+                }
+                if (micOpen && g_micHeard.load()) SpeechHealth::Resolved(SpeechHealth::Issue::MicrophoneSilent);
+                else if (micOpen && g_app.micEnabled && now - micOpenedAt > kMicSilentMs) SpeechHealth::Report(SpeechHealth::Issue::MicrophoneSilent);
+                if (!micOpen && g_app.pttArmed) { // нажали «говорить», а слушать нечем
+                    g_app.pttArmed = false;
+                    Caption::Set(Lang::Tr("микрофон не найден — можно писать текстом"));
+                }
+            }
             {
                 std::lock_guard lock(g_inputMutex);
                 pending.insert(pending.end(), g_input.begin(), g_input.end());
@@ -435,20 +585,29 @@ namespace {
                 g_liveBusy = false;
                 Log::Write("распознавание: whisper выгружен, слушает GigaAM-v3");
             }
-            if (g_reload.exchange(false)) { // выбрали другую модель распознавания
+            if (g_reload.exchange(false)) { // выбрали другую модель распознавания или текущая не справляется
+                const bool unreliable = g_unreliable.exchange(false);
                 StopLive();
                 vad.Reset();
+                strikes = 0;
                 g_liveBusy = true;
-                const std::wstring next = FindModelFile();
-                whisper_context_params reloadParams = whisper_context_default_params();
-                reloadParams.use_gpu = false;
-                if (whisper_context* fresh = next.empty() ? nullptr : whisper_init_from_file_with_params(Text::ToUtf8(next).c_str(), reloadParams)) {
+                if (!unreliable) { // выбор человека: всем моделям снова шанс, выбранной — даже если раньше не прошла проверку
+                    { std::lock_guard lock(g_skipMutex); g_sessionSkip.clear(); }
+                    if (const std::wstring chosen = ChosenModel(); !chosen.empty()) SpeechHealth::Forget(chosen);
+                }
+                const std::wstring previous = modelPath;
+                std::wstring next;
+                if (whisper_context* fresh = LoadWorkingModel(next, !unreliable)) {
                     if (liveState) whisper_free_state(liveState);
                     if (ctx) whisper_free(ctx);
                     ctx = fresh;
                     liveState = whisper_init_state(ctx);
                     modelPath = next;
-                    Log::Write("распознавание: новая модель");
+                    if (unreliable) SpeechHealth::Report(SpeechHealth::Issue::ModelUnreliable, FileName(modelPath));
+                } else if (unreliable) { // запасной нет — остаёмся на той, что есть
+                    SkipForSession(previous, false);
+                    SpeechHealth::Forget(previous); // единственная — не помечаем сломанной, иначе в следующий раз не будет никакой
+                    SpeechHealth::Report(SpeechHealth::Issue::NoBetterModel);
                 }
                 g_liveBusy = false;
             }
@@ -508,6 +667,7 @@ namespace {
                     StopLive(); // черновик больше не нужен, ядра отдаём итоговому распознаванию
                     g_app.capturing = false;
                     if (vad.VoicedMs() >= kMinBurstMs) {
+                        const bool addressed = g_app.pttArmed.load() || NowMs() < g_app.followUpUntil.load(); // точно говорили с ней
                         // параметры звука считаем до распознавания: Transcribe меняет громкость сигнала
                         const BodySounds::Burst burst = BodySounds::Analyze(vad.Segment(), vad.Noise());
                         const bool shortSound = vad.VoicedMs() < kMinSpeechMs;
@@ -534,6 +694,7 @@ namespace {
                         g_app.utteranceEndAt = NowMs();
                         g_app.transcribing = true;
                         std::string text;
+                        bool viaWhisper = true; // черновик — тоже whisper
                         {
                             std::lock_guard lock(g_liveMutex);
                             if (!g_draftText.empty() && g_draftSamples + kSampleRate * 3 / 10 >= vad.Segment().size()) { // черновик уже знает всю фразу
@@ -541,7 +702,7 @@ namespace {
                                 g_confidence = g_draftConfidence.load();
                             }
                         }
-                        if (text.empty()) text = Recognize(ctx, modelPath, vad.Segment());
+                        if (text.empty()) text = Recognize(ctx, modelPath, vad.Segment(), &viaWhisper);
                         g_app.transcribing = false;
 
                         const BodySounds::Kind body = BodySounds::Classify(text, burst);
@@ -551,6 +712,19 @@ namespace {
                                        (body == BodySounds::Kind::Cough ? "  → кашель" : body == BodySounds::Kind::Sneeze ? "  → чих" : "  → шум, пропускаю"));
                         else
                             Log::Write("услышала: «" + text + "»");
+
+                        // Самопроверка на живой речи: к ней обращались, звука было достаточно, а whisper раз за разом выдаёт пустоту или мусор —
+                        // модель не справляется, переходим на следующую. Тихо, шум, кашель — не в счёт
+                        if (viaWhisper && addressed && !shortSound && body == BodySounds::Kind::None && vad.VoicedMs() >= kStrikeMinMs) {
+                            strikes = garbage || g_confidence.load() < kStrikeConfidence ? strikes + 1 : 0;
+                            if (strikes >= kStrikes) {
+                                strikes = 0;
+                                SpeechHealth::MarkBroken(modelPath, std::to_string(kStrikes) + " фразы подряд не разобраны");
+                                SkipForSession(modelPath, true);
+                                g_unreliable = true;
+                                g_reload = true;
+                            }
+                        }
 
                         if (body != BodySounds::Kind::None) Brain::OnBodySound(body);
                         else if (!garbage) Brain::OnHeard(text); // короткое «Аня» — тоже речь
@@ -568,7 +742,8 @@ namespace {
         }
 
         g_app.audioReady = false;
-        ma_device_uninit(&device);
+        if (micOpen) ma_device_uninit(&device);
+        if (audioContext) ma_context_uninit(&audio);
         StopLive();
         live.join();
         if (liveState) whisper_free_state(liveState);

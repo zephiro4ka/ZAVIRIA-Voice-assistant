@@ -587,6 +587,8 @@ void Scenarios::StartTriggers() {
     started.wait();
 }
 
+void Scenarios::SystemNotify(const std::string& title, const std::string& text) { Notify(title, text); }
+
 void Scenarios::StopTriggers() {
     g_stopping = true;
     if (HWND window = g_triggerWindow) PostMessageW(window, WM_CLOSE, 0, 0);

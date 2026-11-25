@@ -89,6 +89,8 @@ namespace Scenarios {
     // Горячие клавиши и уведомления — свой поток, перечитывает сценарии после Save
     void StartTriggers();
     void StopTriggers();
+    // Уведомление системы (значок в трее) — из любого потока
+    void SystemNotify(const std::string& title, const std::string& text);
 
     const char* StepName(Step step);
     int MonitorCount();

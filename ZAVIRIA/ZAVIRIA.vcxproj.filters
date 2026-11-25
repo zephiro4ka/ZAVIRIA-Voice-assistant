@@ -260,6 +260,9 @@
     <ClCompile Include="app\Ears.cpp">
       <Filter>Аня</Filter>
     </ClCompile>
+    <ClCompile Include="app\SpeechHealth.cpp">
+      <Filter>Аня</Filter>
+    </ClCompile>
     <ClCompile Include="app\Graphics.cpp">
       <Filter>Аня</Filter>
     </ClCompile>
@@ -297,6 +300,9 @@
       <Filter>Аня</Filter>
     </ClInclude>
     <ClInclude Include="app\Ears.h">
+      <Filter>Аня</Filter>
+    </ClInclude>
+    <ClInclude Include="app\SpeechHealth.h">
       <Filter>Аня</Filter>
     </ClInclude>
     <ClInclude Include="app\Graphics.h">
